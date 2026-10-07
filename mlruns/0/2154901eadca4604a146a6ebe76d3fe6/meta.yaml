@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/mal/Documents/Vin/K4-L3-DAY21-NgoHoangThuyKhue-2A202603017-CI-CD-for-AI-Systems/mlruns/0/2154901eadca4604a146a6ebe76d3fe6/artifacts
+end_time: 1791367225111
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 2154901eadca4604a146a6ebe76d3fe6
+run_name: carefree-hare-470
+run_uuid: 2154901eadca4604a146a6ebe76d3fe6
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1791367220835
+status: 3
+tags: []
+user_id: mal
