@@ -6,87 +6,212 @@ on:
     paths:
       - 'data/**.dvc'
       - 'src/**.py'
+      - 'tests/**.py'
       - 'params.yaml'
+      - 'requirements.txt'
+      - '.dvc/config'
+      - '.github/workflows/cicd.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+
+  # ---------------------------------------------------------------------------
+  # JOB 1 - UNIT TEST
+  # Chay unit tests tren du lieu ao (khong can ket noi cloud storage).
+  # Neu co bat ky test nao that bai, pipeline dung lai o day va khong tien hanh
+  # huan luyen hay trien khai.
+  # ---------------------------------------------------------------------------
   unit-test:
     name: Unit Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+          cache: pip
+
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Run unit tests
-        run: pytest tests/ -v
 
+      - name: Run unit tests
+        run: python -m pytest tests/ -v
+
+
+  # ---------------------------------------------------------------------------
+  # JOB 2 - TRAIN
+  # Xac thuc cloud storage, pull du lieu bang DVC, huan luyen mo hinh, upload artifact.
+  # Chi chay khi Job 1 (Unit Test) hoan thanh thanh cong.
+  # ---------------------------------------------------------------------------
   train:
     name: Train
     needs: unit-test
     runs-on: ubuntu-latest
     outputs:
       f1: ${{ steps.read_report.outputs.f1 }}
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+          cache: pip
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
       - name: Authenticate to Cloud Storage
+        env:
+          STORAGE_CREDENTIALS: ${{ secrets.STORAGE_CREDENTIALS }}
         run: |
-          echo '${{ secrets.STORAGE_CREDENTIALS }}' > /tmp/sa-key.json
-          echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa-key.json" >> $GITHUB_ENV
+          python - <<'PYEOF'
+          import json
+          import os
+
+          raw_credentials = os.environ.get("STORAGE_CREDENTIALS", "")
+          if not raw_credentials:
+              raise SystemExit("STORAGE_CREDENTIALS is not configured.")
+
+          try:
+              credentials = json.loads(raw_credentials)
+          except json.JSONDecodeError as exc:
+              raise SystemExit("STORAGE_CREDENTIALS must be valid JSON.") from exc
+
+          required_keys = ("aws_access_key_id", "aws_secret_access_key")
+          missing_keys = [key for key in required_keys if not credentials.get(key)]
+          if missing_keys:
+              raise SystemExit(
+                  "STORAGE_CREDENTIALS is missing: " + ", ".join(missing_keys)
+              )
+
+          aws_environment = {
+              "AWS_ACCESS_KEY_ID": credentials["aws_access_key_id"],
+              "AWS_SECRET_ACCESS_KEY": credentials["aws_secret_access_key"],
+          }
+          if credentials.get("aws_session_token"):
+              aws_environment["AWS_SESSION_TOKEN"] = credentials["aws_session_token"]
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              for name, value in aws_environment.items():
+                  if not isinstance(value, str) or "\n" in value or "\r" in value:
+                      raise SystemExit(f"Invalid value for {name}.")
+                  print(f"::add-mask::{value}")
+                  print(f"{name}={value}", file=env_file)
+          PYEOF
+
       - name: Pull data with DVC
         run: dvc pull data/train_batch1.csv.dvc data/holdout.csv.dvc
+
       - name: Train model
         run: python src/train.py
+
       - name: Read report
         id: read_report
         run: |
-          F1=$(python -c "import json; d=json.load(open('outputs/report.json')); print(d['f1_score'])")
-          echo "f1=$F1" >> $GITHUB_OUTPUT
+          python - <<'PYEOF'
+          import json
+          import math
+          import os
+
+          with open("outputs/report.json", encoding="utf-8") as report_file:
+              report = json.load(report_file)
+
+          f1 = float(report["f1_score"])
+          if not math.isfinite(f1) or not 0.0 <= f1 <= 1.0:
+              raise SystemExit(f"Invalid f1_score in report: {f1}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output_file:
+              print(f"f1={f1}", file=output_file)
+          print(f"Read f1_score={f1:.4f} from outputs/report.json")
+          PYEOF
+
       - name: Upload model to Cloud Storage
         env:
           ARTIFACT_BUCKET: ${{ secrets.ARTIFACT_BUCKET }}
         run: |
           python - <<'PYEOF'
           import os
-          from google.cloud import storage
-          client = storage.Client()
-          bucket = client.bucket(os.environ["ARTIFACT_BUCKET"])
-          blob = bucket.blob("artifacts/current/model.joblib")
-          blob.upload_from_filename("models/model.joblib")
-          print("Uploaded model.joblib successfully")
+
+          import boto3
+
+          model_path = "models/model.joblib"
+          model_key = "artifacts/current/model.joblib"
+          bucket = os.environ.get("ARTIFACT_BUCKET", "").strip()
+
+          if not bucket:
+              raise SystemExit("ARTIFACT_BUCKET is not configured.")
+          if not os.path.isfile(model_path):
+              raise SystemExit(f"Model file does not exist: {model_path}")
+
+          s3 = boto3.client("s3")
+          s3.upload_file(model_path, bucket, model_key)
+          print(f"Uploaded {model_path} to s3://{bucket}/{model_key}")
           PYEOF
+
       - name: Save report as artifact
         uses: actions/upload-artifact@v4
         with:
           name: report
           path: outputs/report.json
 
+
+  # ---------------------------------------------------------------------------
+  # JOB 3 - QUALITY GATE
+  # Kiem tra nguong chat luong (f1_score >= 0.65).
+  # Pipeline dung lai o day neu mo hinh chua dat yeu cau.
+  #
+  # Luu y: nguong o day dat tren f1_score chu KHONG phai accuracy. Bo du lieu
+  # Adult co ty le lop 75/25, nen mot mo hinh doan bua "thu nhap thap" cho moi
+  # mau da dat accuracy 0.75 ma hoan toan vo dung.
+  # Chi chay khi Job 2 (Train) hoan thanh thanh cong.
+  # ---------------------------------------------------------------------------
   quality-gate:
     name: Quality Gate
     needs: train
     runs-on: ubuntu-latest
     steps:
+
       - name: Check quality gate
+        env:
+          F1_SCORE: ${{ needs.train.outputs.f1 }}
         run: |
           python - <<'PYEOF'
-          f1 = float("${{ needs.train.outputs.f1 }}")
-          if f1 < 0.65:
-              raise SystemExit(f"FAILED: f1_score {f1:.4f} < 0.65. Huy trien khai.")
-          print(f"PASSED: f1_score {f1:.4f} >= 0.65. Dang trien khai model.")
+          import math
+          import os
+
+          threshold = 0.65
+          try:
+              f1 = float(os.environ["F1_SCORE"])
+          except (KeyError, ValueError) as exc:
+              raise SystemExit("FAILED: train job did not produce a valid f1_score.") from exc
+
+          if not math.isfinite(f1):
+              raise SystemExit("FAILED: f1_score is not finite. Deployment cancelled.")
+          if f1 < threshold:
+              raise SystemExit(
+                  f"FAILED: f1_score {f1:.4f} < {threshold:.2f}. Deployment cancelled."
+              )
+
+          print(f"PASSED: f1_score {f1:.4f} >= {threshold:.2f}. Deploying model.")
           PYEOF
 
+
+  # ---------------------------------------------------------------------------
+  # JOB 4 - RELEASE
+  # Trien khai len VM qua SSH.
+  # Chi chay khi Job 3 (Quality Gate) hoan thanh thanh cong.
+  # ---------------------------------------------------------------------------
   release:
     name: Release
     needs: quality-gate
     runs-on: ubuntu-latest
     steps:
+
       - name: SSH deploy to VM
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -94,6 +219,23 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
+            set -eu
             sudo systemctl restart income-api
-            sleep 5
-            curl -sf http://localhost:8080/healthz && echo "Health check passed." || exit 1
+
+            attempt=1
+            while [ "$attempt" -le 12 ]; do
+              if curl --fail --silent --show-error http://localhost:8080/healthz; then
+                echo
+                echo "Health check passed."
+                exit 0
+              fi
+
+              echo "Health check attempt $attempt/12 failed; retrying in 5 seconds."
+              attempt=$((attempt + 1))
+              sleep 5
+            done
+
+            echo "Health check failed after 12 attempts."
+            sudo systemctl status income-api --no-pager || true
+            sudo journalctl -u income-api -n 50 --no-pager || true
+            exit 1
